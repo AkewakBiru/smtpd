@@ -10,8 +10,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
+	"mime/quotedprintable"
 	"net"
 	"os"
 	"regexp"
@@ -22,10 +23,11 @@ import (
 
 var (
 	// Debug `true` enables verbose logging.
-	Debug      = false
+	Debug      = true
 	rcptToRE   = regexp.MustCompile(`[Tt][Oo]:\s?<(.+)>`)
 	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:\s?<(.*)>(\s(.*))?`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
-	mailSizeRE = regexp.MustCompile(`[Ss][Ii][Zz][Ee]=(\d+)`)
+	// mailSizeRE = regexp.MustCompile(`[Ss][Ii][Zz][Ee]=(\d+)`)
+	// mailFromRE = regexp.MustCompile(`(?i)^from:\s*<([^>]*)>(?:\s+(.*))?$`)
 )
 
 // Handler function called upon successful receipt of an email.
@@ -110,11 +112,11 @@ func (srv *Server) ConfigureTLSWithPassphrase(
 	keyFile string,
 	passphrase string,
 ) error {
-	certPEMBlock, err := ioutil.ReadFile(certFile)
+	certPEMBlock, err := os.ReadFile(certFile)
 	if err != nil {
 		return err
 	}
-	keyPEMBlock, err := ioutil.ReadFile(keyFile)
+	keyPEMBlock, err := os.ReadFile(keyFile)
 	if err != nil {
 		return err
 	}
@@ -193,6 +195,9 @@ type session struct {
 	remoteName    string // Remote hostname as supplied with EHLO
 	tls           bool
 	authenticated bool
+
+	encoding string
+	// smtpUTF8 bool
 }
 
 // Create new session from connection.
@@ -217,6 +222,70 @@ func (srv *Server) newSession(conn net.Conn) (s *session) {
 	_, s.tls = s.conn.(*tls.Conn)
 
 	return
+}
+
+func ParseSMTPParams(arg string) (map[string]string, error) {
+	params := make(map[string]string)
+	if strings.TrimSpace(arg) == "" {
+		return params, nil
+	}
+	for _, field := range strings.Fields(arg) {
+		// Flag parameter (e.g. SMTPUTF8)
+		if !strings.Contains(field, "=") {
+			key := strings.ToUpper(field)
+			params[key] = ""
+			continue
+		}
+
+		kv := strings.SplitN(field, "=", 2)
+		if len(kv[0]) == 0 {
+			continue
+		}
+		if kv[0] == "" || kv[1] == "" {
+			return nil, fmt.Errorf("invalid parameter: %s", field)
+		}
+		key := strings.ToUpper(kv[0])
+		value := kv[1]
+		if _, exists := params[key]; exists {
+			return nil, fmt.Errorf("duplicate parameter: %s", key)
+		}
+		params[key] = value
+	}
+	return params, nil
+}
+
+func (s *session) decodeData(data []byte) []byte {
+	idx := bytes.Index(data, []byte("\r\n\r\n"))
+	if idx == -1 {
+		log.Print("couldn't find the index for header and body separator")
+		return data
+	}
+	final := bytes.TrimSpace(data[idx+4:])
+	var dst []byte
+	switch s.encoding {
+	case "7bit", "8bit":
+		dst = final
+	case "base64":
+		dst = make([]byte, base64.StdEncoding.DecodedLen(len(final)))
+		if size, err := base64.StdEncoding.Decode(dst, final); err != nil {
+			log.Print(err.Error())
+			// fmt.Println(err.Error())
+		} else {
+			dst = dst[:size]
+		}
+	case "quoted-printable":
+		qpReader := quotedprintable.NewReader(bytes.NewBuffer(final))
+		dec, err := io.ReadAll(qpReader)
+		if err != nil {
+			log.Print(err.Error())
+			return data
+		}
+		dst = dec
+	default:
+		log.Print("smtp: unknown data encoding detected")
+		dst = final
+	}
+	return fmt.Appendf(data[:idx], "\r\n\r\n%s", dst)
 }
 
 // Function called to handle connection requests.
@@ -279,22 +348,29 @@ loop:
 			} else {
 				// Validate the SIZE parameter if one was sent.
 				if len(match[2]) > 0 { // A parameter is present
-					sizeMatch := mailSizeRE.FindStringSubmatch(match[3])
-					if sizeMatch == nil {
+					params, err := ParseSMTPParams(match[2])
+					if err != nil {
 						s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
-					} else {
-						// Enforce the maximum message size if one is set.
-						size, err := strconv.Atoi(sizeMatch[1])
-						if err != nil { // Bad SIZE parameter
-							s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
-						} else if s.srv.MaxSize > 0 && size > s.srv.MaxSize { // SIZE above maximum size, if set
-							err = maxSizeExceeded(s.srv.MaxSize)
-							s.writef(err.Error())
-						} else { // SIZE ok
-							from = match[1]
-							gotFrom = true
-							s.writef("250 2.1.0 Ok")
+						break
+					}
+					if val, ok := params["BODY"]; ok {
+						if !strings.EqualFold(val, "7BIT") && !strings.EqualFold(val, "8BITMIME") &&
+							!strings.EqualFold(val, "BINARYMIME") {
+							s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid BODY parameter)")
+							break
 						}
+					}
+					// Enforce the maximum message size if one is set.
+					size, err := strconv.Atoi(params["SIZE"])
+					if err != nil { // Bad SIZE parameter
+						s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
+					} else if s.srv.MaxSize > 0 && size > s.srv.MaxSize { // SIZE above maximum size, if set
+						err = maxSizeExceeded(s.srv.MaxSize)
+						s.writef(err.Error())
+					} else { // SIZE ok
+						from = match[1]
+						gotFrom = true
+						s.writef("250 2.1.0 Ok")
 					}
 				} else { // No parameters after FROM
 					from = match[1]
@@ -374,7 +450,7 @@ loop:
 					continue
 				}
 			}
-
+			data = s.decodeData(data)
 			// Create Received header & write message body into buffer.
 			buffer.Reset()
 			buffer.Write(s.makeHeaders(to))
@@ -595,6 +671,12 @@ func (s *session) readData() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		if bytes.Contains(line, []byte("Content-Transfer-Encoding")) {
+			enc := strings.Split(strings.TrimSpace(string(line)), ":")
+			if len(enc) > 0 {
+				s.encoding = strings.TrimSpace(enc[1])
+			}
+		}
 		// Handle end of data denoted by lone period (\r\n.\r\n)
 		if bytes.Equal(line, []byte(".\r\n")) {
 			break
@@ -611,7 +693,6 @@ func (s *session) readData() ([]byte, error) {
 				return nil, maxSizeExceeded(s.srv.MaxSize)
 			}
 		}
-
 		data = append(data, line...)
 	}
 	return data, nil
@@ -651,6 +732,12 @@ func (s *session) makeEHLOResponse() (response string) {
 	// RFC 1870 specifies that "SIZE 0" indicates no maximum size is in force.
 	response += fmt.Sprintf("250-SIZE %d\r\n", s.srv.MaxSize)
 
+	// RFC 6152 / RFC 6531 requires 8BITMIME for SMTPUTF8
+	response += "250-8BITMIME\r\n"
+
+	// RFC 6531 SMTPUTF8 extension
+	response += "250-SMTPUTF8\r\n"
+
 	// Only list STARTTLS if TLS is configured, but not currently in use.
 	if s.srv.TLSConfig != nil && !s.tls {
 		response += "250-STARTTLS\r\n"
@@ -669,6 +756,7 @@ func (s *session) makeEHLOResponse() (response string) {
 		}
 	}
 
+	// Last line must NOT have a dash
 	response += "250 ENHANCEDSTATUSCODES"
 	return
 }

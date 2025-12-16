@@ -1,3 +1,3 @@
-module git.mills.io/prologic/smtpd
+module github.com/AkewakBiru/smtpd
 
-go 1.14
+go 1.25.1
