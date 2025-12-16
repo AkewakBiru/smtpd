@@ -26,8 +26,6 @@ var (
 	Debug      = false
 	rcptToRE   = regexp.MustCompile(`[Tt][Oo]:\s?<(.+)>`)
 	mailFromRE = regexp.MustCompile(`[Ff][Rr][Oo][Mm]:\s?<(.*)>(\s(.*))?`) // Delivery Status Notifications are sent with "MAIL FROM:<>"
-	// mailSizeRE = regexp.MustCompile(`[Ss][Ii][Zz][Ee]=(\d+)`)
-	// mailFromRE = regexp.MustCompile(`(?i)^from:\s*<([^>]*)>(?:\s+(.*))?$`)
 )
 
 // Handler function called upon successful receipt of an email.
@@ -267,22 +265,16 @@ func (s *session) decodeData(data []byte) []byte {
 		dst = final
 	case "base64":
 		dst = make([]byte, base64.StdEncoding.DecodedLen(len(final)))
-		if size, err := base64.StdEncoding.Decode(dst, final); err != nil {
-			log.Print(err.Error())
-			// fmt.Println(err.Error())
-		} else {
+		if size, err := base64.StdEncoding.Decode(dst, final); err == nil {
 			dst = dst[:size]
 		}
 	case "quoted-printable":
 		qpReader := quotedprintable.NewReader(bytes.NewBuffer(final))
-		dec, err := io.ReadAll(qpReader)
-		if err != nil {
-			log.Print(err.Error())
-			return data
+		if dec, err := io.ReadAll(qpReader); err == nil {
+			dst = dec
 		}
-		dst = dec
 	default:
-		log.Print("smtp: unknown data encoding detected")
+		s.writef("501 5.5.4 Syntax error in parameters or arguments (unknown encoding)")
 		dst = final
 	}
 	return fmt.Appendf(data[:idx], "\r\n\r\n%s", dst)
@@ -325,7 +317,7 @@ loop:
 			buffer.Reset()
 		case "EHLO":
 			s.remoteName = args
-			s.writef(s.makeEHLOResponse())
+			s.writef("%s", s.makeEHLOResponse())
 
 			// RFC 2821 section 4.1.4 specifies that EHLO has the same effect as RSET.
 			from = ""
@@ -366,7 +358,7 @@ loop:
 						s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
 					} else if s.srv.MaxSize > 0 && size > s.srv.MaxSize { // SIZE above maximum size, if set
 						err = maxSizeExceeded(s.srv.MaxSize)
-						s.writef(err.Error())
+						s.writef("%s", err.Error())
 					} else { // SIZE ok
 						from = match[1]
 						gotFrom = true
@@ -436,14 +428,14 @@ loop:
 			// On other errors, allow the client to try again.
 			data, err := s.readData()
 			if err != nil {
-				switch err.(type) {
+				switch err := err.(type) {
 				case net.Error:
-					if err.(net.Error).Timeout() {
+					if err.Timeout() {
 						s.writef("421 4.4.2 %s %s ESMTP Service closing transmission channel after timeout exceeded", s.srv.Hostname, s.srv.Appname)
 					}
 					break loop
 				case maxSizeExceededError:
-					s.writef(err.Error())
+					s.writef("%s", err.Error())
 					continue
 				default:
 					s.writef("451 4.3.0 Requested action aborted: local error in processing")
@@ -585,7 +577,7 @@ loop:
 					break loop
 				}
 
-				s.writef(err.Error())
+				s.writef("%s", err.Error())
 				break
 			}
 
@@ -608,7 +600,7 @@ func (s *session) writef(format string, args ...interface{}) error {
 	}
 
 	line := fmt.Sprintf(format, args...)
-	fmt.Fprintf(s.bw, line+"\r\n")
+	fmt.Fprintf(s.bw, "%s\r\n", line)
 	err := s.bw.Flush()
 
 	if Debug {
@@ -765,7 +757,7 @@ func (s *session) handleAuthLogin(arg string) (bool, error) {
 	var err error
 
 	if arg == "" {
-		s.writef("334 " + base64.StdEncoding.EncodeToString([]byte("Username:")))
+		s.writef("334 %s", base64.StdEncoding.EncodeToString([]byte("Username:")))
 		arg, err = s.readLine()
 		if err != nil {
 			return false, err
@@ -777,7 +769,7 @@ func (s *session) handleAuthLogin(arg string) (bool, error) {
 		return false, errors.New("501 5.5.2 Syntax error (unable to decode)")
 	}
 
-	s.writef("334 " + base64.StdEncoding.EncodeToString([]byte("Password:")))
+	s.writef("334 %s", base64.StdEncoding.EncodeToString([]byte("Password:")))
 	line, err := s.readLine()
 	if err != nil {
 		return false, err
@@ -825,7 +817,7 @@ func (s *session) handleAuthPlain(arg string) (bool, error) {
 func (s *session) handleAuthCramMD5() (bool, error) {
 	shared := "<" + strconv.Itoa(os.Getpid()) + "." + strconv.Itoa(time.Now().Nanosecond()) + "@" + s.srv.Hostname + ">"
 
-	s.writef("334 " + base64.StdEncoding.EncodeToString([]byte(shared)))
+	s.writef("334 %s", base64.StdEncoding.EncodeToString([]byte(shared)))
 
 	data, err := s.readLine()
 	if err != nil {
