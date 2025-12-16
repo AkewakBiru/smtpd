@@ -342,7 +342,7 @@ loop:
 				if len(match[2]) > 0 { // A parameter is present
 					params, err := ParseSMTPParams(match[2])
 					if err != nil {
-						s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
+						s.writef("501 5.5.4 Syntax error in parameters or arguments (%s)", err.Error())
 						break
 					}
 					if val, ok := params["BODY"]; ok {
@@ -353,13 +353,14 @@ loop:
 						}
 					}
 					// Enforce the maximum message size if one is set.
-					size, err := strconv.Atoi(params["SIZE"])
-					if err != nil { // Bad SIZE parameter
+					strSize, ok := params["SIZE"]
+					size, err := strconv.Atoi(strSize)
+					if ok && err != nil { // Bad SIZE parameter
 						s.writef("501 5.5.4 Syntax error in parameters or arguments (invalid SIZE parameter)")
 					} else if s.srv.MaxSize > 0 && size > s.srv.MaxSize { // SIZE above maximum size, if set
 						err = maxSizeExceeded(s.srv.MaxSize)
 						s.writef("%s", err.Error())
-					} else { // SIZE ok
+					} else if ok { // SIZE ok
 						from = match[1]
 						gotFrom = true
 						s.writef("250 2.1.0 Ok")
