@@ -261,7 +261,7 @@ func (s *session) decodeData(data []byte) []byte {
 	final := bytes.TrimSpace(data[idx+4:])
 	var dst []byte
 	switch s.encoding {
-	case "7bit", "8bit":
+	case "7bit", "8bit", "":
 		dst = final
 	case "base64":
 		dst = make([]byte, base64.StdEncoding.DecodedLen(len(final)))
@@ -687,6 +687,9 @@ func (s *session) readData() ([]byte, error) {
 			}
 		}
 		data = append(data, line...)
+	}
+	if len(s.encoding) == 0 {
+		s.encoding = "7bit" // defaults to 7bit acc. to https://www.ietf.org/rfc/rfc2045#section-6.1
 	}
 	return data, nil
 }
